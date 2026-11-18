@@ -12,8 +12,8 @@
    Leave them empty to play on one device only.
    ===================================================================== */
 window.NOVA_CONFIG = {
-  SUPABASE_URL: "https://vzfvqzmmpatxihtrpxwq.supabase.co",
-  SUPABASE_KEY: "sb_publishable_6W-YHyCy8mSfTPh3wDp8aQ_1AhunjOg"
+  SUPABASE_URL: "",
+  SUPABASE_KEY: ""
 };
 </script>
 <style>
@@ -149,6 +149,21 @@ details summary{cursor:pointer;color:var(--accent);font-family:Orbitron;font-siz
 #cmdPrev{z-index:60}
 @media(max-width:640px){.cvid{width:200px;height:200px}}
 .winbox .pname,.winbox .cname,.winbox .small{text-shadow:0 2px 12px #000,0 0 4px #000}
+
+.badge{display:none;margin-left:6px;background:#ff3b55;color:#fff;border-radius:99px;font-size:10.5px;font-weight:700;padding:1px 6px;vertical-align:1px}
+.chatdrawer{position:absolute;top:12px;right:12px;bottom:12px;width:340px;max-width:calc(100% - 24px);z-index:6;display:flex;flex-direction:column;background:rgba(8,11,30,.93);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border:1px solid var(--line);border-radius:14px;padding:10px;box-shadow:0 10px 40px rgba(0,0,0,.5);transform:translateX(calc(100% + 30px));transition:transform .25s ease;pointer-events:none}
+.chatdrawer.open{transform:none;pointer-events:auto}
+.chatlist{flex:1;overflow-y:auto;padding-right:2px}
+.cmsg{display:flex;gap:8px;align-items:flex-start;padding:6px;border-radius:10px;margin-bottom:4px}
+.cmsg.me{background:rgba(90,209,255,.07)}
+.cmsg.priv{background:rgba(255,90,209,.1);border:1px solid rgba(255,90,209,.3)}
+.ctext{word-wrap:break-word;overflow-wrap:anywhere;font-size:13px;line-height:1.35}
+.ct{color:var(--muted);font-size:10.5px;margin-left:4px}
+.plbl{color:#ffb3ee;font-size:10.5px}
+.cev{font-size:11.5px;color:#aeb6e0;text-align:center;padding:4px 6px;margin:4px 0;border-top:1px dashed rgba(120,140,255,.15)}
+.chatping{position:absolute;right:14px;top:14px;z-index:6;cursor:pointer}
+.pingbox{display:flex;gap:8px;align-items:center;max-width:300px;background:rgba(10,14,36,.95);border:1px solid var(--accent);border-radius:12px;padding:8px 10px;box-shadow:0 0 20px rgba(90,209,255,.3);animation:cin .3s ease-out}
+@media(max-width:980px){.chatdrawer{position:fixed;top:auto;left:0;right:0;bottom:0;width:auto;max-width:none;height:62vh;border-radius:16px 16px 0 0;transform:translateY(105%)}.chatdrawer.open{transform:none}.chatping{position:fixed;top:60px}}
 
 </style>
 </head>
@@ -670,7 +685,20 @@ async function makeSupabaseStore(){
       }
       return {err:'Several players acted at once — please try again.'};
     },
-    async remove(id){const {error}=await sb.from(T).delete().eq('id',id);if(error)throw error}
+    async remove(id){const {error}=await sb.from(T).delete().eq('id',id);if(error)throw error;try{await sb.from('nova_chat').delete().eq('game_id',id)}catch(e){}},
+    chatOpen(gid,cb,onErr){
+      let last=0,dead=false,busyPull=false,warned=false;
+      const pull=async()=>{if(dead||busyPull)return;busyPull=true;try{
+        const {data,error}=await sb.from('nova_chat').select('id,from_seat,to_seat,kind,text,created_at').eq('game_id',gid).gt('id',last).order('id',{ascending:true}).limit(300);
+        if(dead)return;if(error){if(!warned){warned=true;onErr&&onErr(error)}return}
+        if(data&&data.length){last=data[data.length-1].id;cb(data.map(r=>({id:r.id,from:r.from_seat,to:r.to_seat,kind:r.kind,text:r.text,t:Date.parse(r.created_at)})))}
+      }finally{busyPull=false}};
+      pull();
+      const ch=sb.channel('novachat-'+gid+'-'+TAB).on('postgres_changes',{event:'INSERT',schema:'public',table:'nova_chat',filter:'game_id=eq.'+gid},()=>pull()).subscribe();
+      const iv=setInterval(pull,8000);
+      return ()=>{dead=true;clearInterval(iv);try{sb.removeChannel(ch)}catch(e){}};
+    },
+    async chatSend(gid,m){const {error}=await sb.from('nova_chat').insert({game_id:gid,from_seat:m.from,to_seat:m.to,kind:m.kind||'msg',text:m.text});if(error)throw error}
   };
 }
 async function makeClaudeStore(DB,USER){
@@ -690,10 +718,13 @@ async function makeClaudeStore(DB,USER){
       try{await ref.set(g)}catch(e){if(e&&e.code==='invalid_argument'){st.canWrite=false;return {err:'Your access to this page is view-only.'}}throw e}
       return {g};
     },
-    async remove(id){await DB.doc('games/'+id).delete()}
+    async remove(id){await DB.doc('games/'+id).delete()},
+    chatOpen(gid,cb,onErr){const seen=new Set();return DB.collection('chats/'+gid+'/msgs').orderBy('t','desc').limit(300).onSnapshot(qs=>{const fresh=[];qs.docs.forEach(d=>{if(!seen.has(d.id)){seen.add(d.id);fresh.push({id:d.id,...d.data()})}});if(fresh.length)cb(fresh.sort((a,b)=>a.t-b.t))},err=>onErr&&onErr(err))},
+    async chatSend(gid,m){await DB.collection('chats/'+gid+'/msgs').add({from:m.from,to:m.to??null,kind:m.kind||'msg',text:m.text,t:Date.now()})}
   };
   return st;
 }
+const chatSubs={};
 function makeLocalStore(){
   const KEY='nova-local-games';let map={};try{map=JSON.parse(lsGet(KEY)||'{}')||{}}catch(e){map={}}
   const persisted=lsSet('nova-probe','1');const save=()=>lsSet(KEY,JSON.stringify(map));const subs={};
@@ -703,7 +734,9 @@ function makeLocalStore(){
     async create(g){map[g.id]=withMeta(g);save()},
     open(id,cb){subs[id]=cb;setTimeout(()=>cb(map[id]?clone(map[id]):null));return ()=>{delete subs[id]}},
     async commit(id,fn){if(!map[id])return {err:'Game not found.'};const g=clone(map[id]);const err=fn(g);if(err)return {err};g.updatedAt=Date.now();map[id]=withMeta(g);save();return {g:clone(g)}},
-    async remove(id){delete map[id];save()}
+    async remove(id){delete map[id];save();lsSet('nova-chat-'+id,'[]')},
+    chatOpen(gid,cb){chatSubs[gid]=cb;let a=[];try{a=JSON.parse(lsGet('nova-chat-'+gid)||'[]')}catch(e){}setTimeout(()=>a.length&&cb(a));return ()=>{delete chatSubs[gid]}},
+    async chatSend(gid,m){let a=[];try{a=JSON.parse(lsGet('nova-chat-'+gid)||'[]')}catch(e){}const msg={id:'l'+Date.now()+Math.random().toString(36).slice(2,6),from:m.from,to:m.to??null,kind:m.kind||'msg',text:m.text,t:Date.now()};a.push(msg);if(a.length>300)a=a.slice(-300);lsSet('nova-chat-'+gid,JSON.stringify(a));chatSubs[gid]&&chatSubs[gid]([msg])}
   };
 }
 let STORE=null,STORE_NOTE='';
@@ -731,7 +764,7 @@ function wrapFx(fn){return g=>{g.fx=[];const e=fn(g);if(e)return e;if(g.fx.lengt
 async function act(fn,after){
   if(!G)return;if(busy){toast('One moment — saving…');return}
   busy=true;
-  try{const res=await STORE.commit(G.id,wrapFx(fn));if(res.err){toast(res.err);return}if(after)after(res.g);onState(res.g)}
+  try{const res=await STORE.commit(G.id,wrapFx(fn));if(res.err){toast(res.err);return}if(after)after(res.g);onState(res.g);postEvents(res.g)}
   catch(e){toast('Could not save: '+(e&&(e.message||e.code)||'unknown error'))}
   finally{busy=false}
 }
@@ -739,7 +772,7 @@ function onState(g){
   if(!g)return;
   const first=!G||G.id!==g.id;const prevTurn=G?G.turn:-1;
   G=g;
-  if(first){ui.fxSeen=g.fxSeq||0;buildGameShell();render();turnBanner(g.turn,true);return}
+  if(first){ui.fxSeen=g.fxSeq||0;buildGameShell();startChat(g.id);render();turnBanner(g.turn,true);return}
   render();
   if((g.fxSeq||0)>ui.fxSeen){ui.fxSeen=g.fxSeq;playFx(g.fx||[])}
 }
@@ -748,6 +781,7 @@ function onState(g){
 function route(){
   const id=(location.hash||'').slice(1);
   if(unsub){try{unsub()}catch(e){}unsub=null}
+  stopChat();
   G=null;ui.sel=-1;ui.target=-1;ui.mode=null;ui.view={x:0,y:0,k:1};FXQ.length=0;
   if(/^g-[a-z0-9]{4,12}$/.test(id))openGame(id);else renderLobby();
 }
@@ -820,6 +854,7 @@ function buildGameShell(){
     <span class="logo">NOVA DOMINION</span><span class="pill" id="tbName"></span><span class="pill" id="tbRound"></span>
     <span class="status ${STORE.mode==='local'?'off':''}" title="${esc(STORE.label)}"><i></i>${STORE.mode==='local'?'This device':'Online'}</span>
     <span style="flex:1"></span>
+    <button class="small" id="bChat">💬 Chat<span id="chatBadge" class="badge"></span></button>
     <button class="small" id="bShare">Invite players</button>
     <button class="small ghost" id="bLobby">Lobby</button>
   </div>
@@ -835,6 +870,17 @@ function buildGameShell(){
       <div class="legend"><span>◌ outpost</span><span>◯ colony</span><span>◎ citadel</span><span style="color:#ff6b7d">☠ raider</span><span>scroll / pinch to zoom · drag to pan</span></div>
       <div id="banner"></div>
       <div class="cine" id="cine"></div>
+      <div id="chatPing" class="chatping"></div>
+      <div id="chatDrawer" class="chatdrawer">
+        <div class="row" style="justify-content:space-between;margin-bottom:6px"><h2 style="margin:0">Comms channel</h2><button class="small ghost" id="chatClose">✕</button></div>
+        <div id="chatList" class="chatlist"></div>
+        <div id="chatQuick" class="row" style="gap:5px;margin:6px 0">${['Want to trade?','Truce?','Alliance?','Nice move!','Good game'].map(q=>`<button class="small ghost qk" data-q="${q}">${q}</button>`).join('')}</div>
+        <div id="chatComposer">
+          <div class="row small" style="gap:6px;margin-bottom:6px"><span class="muted">As</span><select id="chatFrom"></select><span class="muted">to</span><select id="chatTo"></select></div>
+          <div class="row" style="gap:6px;flex-wrap:nowrap"><input id="chatInput" maxlength="300" placeholder="Message…" style="flex:1;min-width:0"><button class="primary small" id="chatSend">Send</button></div>
+        </div>
+        <div id="chatNote" class="small muted" style="margin-top:6px"></div>
+      </div>
     </div>
     <aside class="side" id="side"></aside>
   </div>`;
@@ -843,6 +889,7 @@ function buildGameShell(){
   $('#bLobby').onclick=()=>{location.hash=''};
   $('#bShare').onclick=()=>{ui.shareOpen=!ui.shareOpen;render()};
   $('#zIn').onclick=()=>zoomBy(1.3);$('#zOut').onclick=()=>zoomBy(1/1.3);$('#zReset').onclick=()=>{ui.view={x:0,y:0,k:1};applyView()};
+  bindChatUI();
   bindMapInput();applyView();
 }
 function mapDefs(){
@@ -1090,6 +1137,89 @@ const FX={
   async win(e){const pl=G.players[e.player];await cine(`<div class="winbox">${USE_MEDIA?`<video class="winvid" src="media/victory.mp4" autoplay muted playsinline loop onerror="this.remove()"></video>`:''}<div class="powerbox" style="position:relative">${portrait(pl.race,170,`class="portrait glowp" style="--gc:${pl.color};margin:0 auto"`)}<div class="pname" style="color:${pl.color}">DOMINION ACHIEVED</div><div class="cname">${esc(pl.name)} rules the cluster</div><div class="small muted">Click to close</div></div></div>`,12000)},
 };
 
+/* ================= CHAT ================= */
+const CHAT={msgs:[],ids:new Set(),unsub:null,open:false,gid:null,openedAt:0,lastSend:0,failed:false};
+function chatSeen(){return +(lsGet('nova-chatseen-'+CHAT.gid)||0)}
+function startChat(gid){
+  stopChat();CHAT.gid=gid;CHAT.msgs=[];CHAT.ids=new Set();CHAT.openedAt=Date.now();CHAT.failed=false;CHAT.open=false;
+  if(!STORE.chatOpen)return;
+  try{CHAT.unsub=STORE.chatOpen(gid,fresh=>{
+    const add=fresh.filter(m=>!CHAT.ids.has(String(m.id)));add.forEach(m=>CHAT.ids.add(String(m.id)));if(!add.length)return;
+    CHAT.msgs.push(...add);CHAT.msgs.sort((a,b)=>a.t-b.t);if(CHAT.msgs.length>400)CHAT.msgs=CHAT.msgs.slice(-400);
+    renderChat();
+    const ping=add.filter(m=>m.kind==='msg'&&m.t>CHAT.openedAt-2000&&chatVisible(m)&&!chatMine().has(m.from));
+    if(ping.length&&!CHAT.open)chatPing(ping[ping.length-1]);
+  },err=>{CHAT.failed=true;renderChat()})}catch(e){CHAT.failed=true}
+}
+function stopChat(){if(CHAT.unsub){try{CHAT.unsub()}catch(e){}}CHAT.unsub=null}
+function chatMine(){if(!G)return new Set();const own=mySeats();if(own.length)return new Set(own);return new Set(G.players.map((p,i)=>i).filter(i=>canControl(i)))}
+function chatVisible(m){if(m.to===null||m.to===undefined)return true;const mine=chatMine();return mine.has(m.from)||mine.has(m.to)}
+function chatTime(t){const d=new Date(t);const today=new Date().toDateString()===d.toDateString();return today?d.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'}):d.toLocaleDateString([],{month:'short',day:'numeric'})+' '+d.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})}
+function renderChat(){
+  const list=$('#chatList');if(!list||!G)return;
+  const vis=CHAT.msgs.filter(chatVisible);
+  const atBottom=list.scrollHeight-list.scrollTop-list.clientHeight<60;
+  list.innerHTML=vis.length?vis.map(m=>{
+    const p=G.players[m.from];
+    if(m.kind==='event')return `<div class="cev">${esc(m.text)}<span class="ct">${chatTime(m.t)}</span></div>`;
+    const priv=m.to!==null&&m.to!==undefined;const mine=chatMine();
+    const lbl=priv?(mine.has(m.from)?`🔒 to ${esc(pname(G,m.to))}`:`🔒 private to you`):'';
+    return `<div class="cmsg ${priv?'priv':''} ${mine.has(m.from)?'me':''}">${p?portrait(p.race,28):''}<div style="min-width:0"><div class="small"><b style="color:${p?p.color:'#aaa'}">${esc(p?p.name:'?')}</b> <span class="ct">${chatTime(m.t)}</span>${lbl?` <span class="plbl">${lbl}</span>`:''}</div><div class="ctext">${esc(m.text)}</div></div></div>`;
+  }).join(''):`<div class="small muted" style="text-align:center;padding:20px 6px">No messages yet. Say hello, propose an alliance, or start a rivalry.</div>`;
+  if(atBottom||CHAT.open)list.scrollTop=list.scrollHeight;
+  const seen=chatSeen(),mine=chatMine();
+  const unread=CHAT.open?0:vis.filter(m=>m.kind==='msg'&&m.t>seen&&!mine.has(m.from)).length;
+  const b=$('#chatBadge');if(b){b.textContent=unread?String(unread>99?'99+':unread):'';b.style.display=unread?'inline-block':'none'}
+  const note=$('#chatNote');if(note){note.textContent=CHAT.failed?(STORE.mode==='supabase'?'Chat isn\'t set up in Supabase yet — run the chat SQL from the README.':'Chat is unavailable right now.'):(STORE.mode==='local'?'Everyone on this device can see all messages.':'Private messages 🔒 only show for the two empires involved.')}
+}
+function updateChatSelects(){
+  const fromSel=$('#chatFrom'),toSel=$('#chatTo'),comp=$('#chatComposer');if(!fromSel||!G)return;
+  const mine=[...chatMine()];
+  if(!mine.length){comp.style.display='none';$('#chatQuick').style.display='none';const n=$('#chatNote');if(n&&!CHAT.failed)n.textContent='Claim an empire (Empires list) to join the chat.';return}
+  comp.style.display='';$('#chatQuick').style.display='';
+  if(document.activeElement!==fromSel){const v=fromSel.value;const want=mine.includes(G.turn)&&!mySeats().length?G.turn:mine[0];fromSel.innerHTML=mine.map(i=>`<option value="${i}">${esc(pname(G,i))}</option>`).join('');fromSel.value=mine.includes(+v)&&v!==''&&mySeats().length?v:String(want)}
+  if(document.activeElement!==toSel){const v=toSel.value;toSel.innerHTML=`<option value="all">Everyone</option>`+G.players.map((p,i)=>`<option value="${i}">🔒 ${esc(p.name)}</option>`).join('');toSel.value=[...toSel.options].some(o=>o.value===v)?v:'all'}
+  [...toSel.options].forEach(o=>{if(o.value!=='all')o.disabled=(+o.value===+fromSel.value)});
+  if(toSel.selectedOptions[0]&&toSel.selectedOptions[0].disabled)toSel.value='all';
+}
+async function chatSendText(text){
+  text=(text||'').trim().slice(0,300);if(!text||!G)return;
+  if(Date.now()-CHAT.lastSend<700){toast('Slow down a little.');return}
+  const from=+$('#chatFrom').value,toV=$('#chatTo').value,to=toV==='all'?null:+toV;
+  if(!chatMine().has(from))return;
+  CHAT.lastSend=Date.now();
+  try{await STORE.chatSend(G.id,{from,to,kind:'msg',text});$('#chatInput').value='';lsSet('nova-chatseen-'+CHAT.gid,String(Date.now()))}
+  catch(e){CHAT.failed=true;renderChat();toast('Message not sent: '+(e.message||e))}
+}
+function setChatOpen(o){CHAT.open=o;const d=$('#chatDrawer');if(d)d.classList.toggle('open',o);if(o){lsSet('nova-chatseen-'+CHAT.gid,String(Date.now()));$('#chatPing').innerHTML='';renderChat();updateChatSelects();setTimeout(()=>{const l=$('#chatList');if(l)l.scrollTop=l.scrollHeight},30)}else renderChat()}
+function bindChatUI(){
+  $('#bChat').onclick=()=>setChatOpen(!CHAT.open);$('#chatClose').onclick=()=>setChatOpen(false);
+  $('#chatSend').onclick=()=>chatSendText($('#chatInput').value);
+  $('#chatInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();chatSendText(e.target.value)}e.stopPropagation()});
+  $('#chatFrom').onchange=()=>updateChatSelects();
+  document.querySelectorAll('#chatQuick .qk').forEach(b=>b.onclick=()=>chatSendText(b.dataset.q));
+  renderChat();
+}
+function chatPing(m){
+  const el=$('#chatPing');if(!el||!G)return;const p=G.players[m.from];const priv=m.to!==null&&m.to!==undefined;
+  el.innerHTML=`<div class="pingbox">${p?portrait(p.race,30):''}<div style="min-width:0"><div class="small"><b style="color:${p?p.color:'#fff'}">${esc(p?p.name:'?')}</b>${priv?' <span class="plbl">🔒 private</span>':''}</div><div class="small ctext">${esc(m.text.length>90?m.text.slice(0,90)+'…':m.text)}</div></div></div>`;
+  el.onclick=()=>setChatOpen(true);clearTimeout(chatPing._t);chatPing._t=setTimeout(()=>{if(el)el.innerHTML=''},4500);
+}
+function postEvents(g){
+  if(!STORE.chatSend||!g||!g.fx)return;
+  const R=i=>REGION_NAMES[g.hexes[i].region]||'deep space';
+  const lines=[];
+  for(const e of g.fx){
+    if(e.type==='battle')lines.push([e.att,`⚔ ${pname(g,e.att)} attacked ${pname(g,e.def)} in ${R(e.at)} — ${e.won?'VICTORY, system captured':'repelled'} (lost ${e.aL}, destroyed ${e.dL})`]);
+    if(e.type==='power'){const L=leaderOf(g,e.player);lines.push([e.player,`⚡ ${L.name} used ${L.power.name}`])}
+    if(e.type==='relic')lines.push([e.player,`⌬ ${pname(g,e.player)} uncovered a relic (+${e.vp} VP)`]);
+    if(e.type==='gate')lines.push([e.player,`🌀 ${pname(g,e.player)} commissioned a Jump Gate`]);
+    if(e.type==='trade')lines.push([e.a,`🤝 Trade completed: ${pname(g,e.a)} ⇄ ${pname(g,e.b)}`]);
+    if(e.type==='win')lines.push([e.player,`★ ${pname(g,e.player)} has achieved dominion over the cluster!`]);
+  }
+  lines.forEach(([from,text])=>STORE.chatSend(g.id,{from,to:null,kind:'event',text}).catch(()=>{}));
+}
+
 /* ================= SIDE PANEL ================= */
 function subLine(p){const pl=G.players[p],L=RACE[pl.race].leader;return pl.name===L.name?RACE[pl.race].name:L.name+' · '+RACE[pl.race].name}
 function render(){
@@ -1122,7 +1252,7 @@ function render(){
     <div class="panel"><h2>Galactic log</h2><div class="log">${g.log.map(l=>`<div>${esc(l)}</div>`).join('')}</div></div>
     ${rulesHtml()}
     <div class="panel small muted">Code <b>${esc(g.id)}</b> · created ${new Date(g.createdAt).toLocaleDateString()} · <button class="small danger" id="bDel">Delete game</button></div>`;
-  bindSide();
+  bindSide();updateChatSelects();
 }
 function sharePanel(){
   const g=G;
